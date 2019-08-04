@@ -1,3 +1,7 @@
+Note: It's just a patch to change the chame mode button's functionality to change colors. My Clevo based turkish brand Monster notebook's keyboard is a single colored keybpard without support modes. Also left color is the keyboard's single color. 
+
+Note: I think Monster notebook owners with multi colored keyboard can use the original tuxedo_keyboard source directly or this one if they prefer.
+
 # Table of Content
 - <a href="#description">Description</a>
 - <a href="#building">Building and Install</a>
