@@ -18,7 +18,8 @@
 * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#include "tuxedo_keyboard.h"
+#define DRIVER_NAME "tuxedo_keyboard"
+#define pr_fmt(fmt) DRIVER_NAME ": " fmt
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -32,6 +33,54 @@ MODULE_AUTHOR
 MODULE_DESCRIPTION("TUXEDO Computer Keyboard Backlight Driver");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.0.0");
+
+/* ::::  Module specific Constants and simple Macros   :::: */
+
+#define __TUXEDO_PR(lvl, fmt, ...) do { pr_##lvl(fmt, ##__VA_ARGS__); } while (0)
+#define TUXEDO_INFO(fmt, ...) __TUXEDO_PR(info, fmt, ##__VA_ARGS__)
+#define TUXEDO_ERROR(fmt, ...) __TUXEDO_PR(err, fmt, ##__VA_ARGS__)
+#define TUXEDO_DEBUG(fmt, ...) __TUXEDO_PR(debug, "[%s:%u] " fmt, __func__, __LINE__, ##__VA_ARGS__)
+
+#define BRIGHTNESS_MIN                  0
+#define BRIGHTNESS_MAX                  255
+#define BRIGHTNESS_DEFAULT              BRIGHTNESS_MAX
+
+#define CLEVO_EVENT_GUID                "ABBC0F6B-8EA1-11D1-00A0-C90629100000"
+#define CLEVO_EMAIL_GUID                "ABBC0F6C-8EA1-11D1-00A0-C90629100000"
+#define CLEVO_GET_GUID                  "ABBC0F6D-8EA1-11D1-00A0-C90629100000"
+
+#define REGION_LEFT                     0xF0000000
+#define REGION_CENTER                   0xF1000000
+#define REGION_RIGHT                    0xF2000000
+#define REGION_EXTRA                    0xF3000000
+
+#define KEYBOARD_BRIGHTNESS             0xF4000000
+
+#define COLOR_BLACK                     0x000000
+#define COLOR_RED                       0xFF0000
+#define COLOR_GREEN                     0x00FF00
+#define COLOR_BLUE                      0x0000FF
+#define COLOR_YELLOW                    0xFFFF00
+#define COLOR_MAGENTA                   0xFF00FF
+#define COLOR_CYAN                      0x00FFFF
+#define COLOR_WHITE                     0xFFFFFF
+
+#define KB_COLOR_DEFAULT                COLOR_WHITE	// Default Color White
+#define DEFAULT_BLINKING_PATTERN                    0
+
+// Method IDs for CLEVO_GET
+#define GET_EVENT                       0x01
+#define GET_AP                          0x46
+#define SET_KB_LED                      0x67
+
+// WMI Codes
+#define WMI_CODE_DECREASE_BACKLIGHT     0x81
+#define WMI_CODE_INCREASE_BACKLIGHT     0x82
+#define WMI_CODE_NEXT_BLINKING_PATTERN              0x83
+#define WMI_CODE_TOGGLE_STATE           0x9F
+
+#define STEP_BRIGHTNESS_STEP            25
+
 
 struct platform_device *tuxedo_platform_device;
 static struct input_dev *tuxedo_input_device;
@@ -66,9 +115,9 @@ static uint param_color_extra = KB_COLOR_DEFAULT;
 module_param_named(color_extra, param_color_extra, uint, S_IRUSR);
 MODULE_PARM_DESC(color_extra, "Color for the Extra Section");
 
-static ushort param_mode = DEFAULT_MODE;
-module_param_cb(mode, &param_ops_mode_ops, &param_mode, S_IRUSR);
-MODULE_PARM_DESC(mode, "Set the mode");
+static ushort param_blinking_pattern = DEFAULT_BLINKING_PATTERN;
+module_param_cb(mode, &param_ops_mode_ops, &param_blinking_pattern, S_IRUSR);
+MODULE_PARM_DESC(mode, "Set the keyboard backlight blinking pattern");
 
 static ushort param_brightness = BRIGHTNESS_DEFAULT;
 module_param_cb(brightness, &param_ops_brightness_ops, &param_brightness,
@@ -93,22 +142,28 @@ static struct {
 	} color;
 
 	u8 brightness;
-	u8 mode;
+	u8 blinking_pattern;
     u8 colormode;
 } keyboard = {
-	.has_extra = 0, .change_button_mode=1, .mode = DEFAULT_MODE, .colormode = 6,
-	.state = 1, .brightness = BRIGHTNESS_DEFAULT,
+	.has_extra = 0,
+	.change_button_mode=1,
+	.colormode = 6,
+	.state = 1,
 	.color = {
 	        .left = KB_COLOR_DEFAULT, .center = KB_COLOR_DEFAULT,
 	        .right = KB_COLOR_DEFAULT, .extra = KB_COLOR_DEFAULT
-	         }
+	         },
+	.brightness = BRIGHTNESS_DEFAULT,
+	.blinking_pattern = DEFAULT_BLINKING_PATTERN
 };
 
-static struct {
+struct blinking_pattern {
 	u8 key;
 	u32 value;
 	const char *const name;
-} blinking_patterns[] = {
+};
+
+static struct blinking_pattern blinking_patterns[] = {
         { .key = 0,.value = 0,.name = "CUSTOM"},
         { .key = 1,.value = 0x1002a000,.name = "BREATHE"},
         { .key = 2,.value = 0x33010000,.name = "CYCLE"},
@@ -176,11 +231,11 @@ static ssize_t show_brightness_fs(struct device *child,
 	return sprintf(buffer, "%d\n", keyboard.brightness);
 }
 
-// Sysfs Interface for the keyboard mode
+// Sysfs Interface for the backlight blinking pattern
 static ssize_t show_blinking_patterns_fs(struct device *child, struct device_attribute *attr,
                                          char *buffer)
 {
-	return sprintf(buffer, "%d\n", keyboard.mode);
+	return sprintf(buffer, "%d\n", keyboard.blinking_pattern);
 }
 
 // Sysfs Interface for if the keyboard has extra region
@@ -192,23 +247,23 @@ static ssize_t show_hasextra_fs(struct device *child,
 
 static int tuxedo_evaluate_wmi_method(u32 method_id, u32 arg, u32 * retval)
 {
-	struct acpi_buffer in = { (acpi_size) sizeof(arg), &arg };
-	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+	struct acpi_buffer acpi_input = { (acpi_size) sizeof(arg), &arg };
+	struct acpi_buffer acpi_output = { ACPI_ALLOCATE_BUFFER, NULL };
 	union acpi_object *obj;
 	acpi_status status;
 	u32 tmp;
 
 	TUXEDO_DEBUG("evaluate method: %0#4x  IN : %0#6x\n", method_id, arg);
 
-	status =
-	    wmi_evaluate_method(CLEVO_GET_GUID, 0x00, method_id, &in, &out);
+	status = wmi_evaluate_method(CLEVO_GET_GUID, 0x00, method_id,
+	                             &acpi_input, &acpi_output);
 
 	if (unlikely(ACPI_FAILURE(status))) {
 		TUXEDO_ERROR("evaluate method error");
 		goto exit;
 	}
 
-	obj = (union acpi_object *)out.pointer;
+	obj = (union acpi_object *)acpi_output.pointer;
 	if (obj && obj->type == ACPI_TYPE_INTEGER) {
 		tmp = (u32) obj->integer.value;
 	} else {
@@ -246,10 +301,10 @@ static ssize_t set_brightness_fs(struct device *child,
 {
 	unsigned int val;
 	// hier unsigned?
-	int ret = kstrtouint(buffer, 0, &val);
 
-	if (ret) {
-		return ret;
+	int err = kstrtouint(buffer, 0, &val);
+	if (err) {
+		return err;
 	}
 
 	val = clamp_t(u8, val, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
@@ -277,16 +332,16 @@ static void set_state(u8 state)
 static ssize_t set_state_fs(struct device *child, struct device_attribute *attr,
 			    const char *buffer, size_t size)
 {
-	unsigned int val;
-	int ret = kstrtouint(buffer, 0, &val);
+	unsigned int state;
 
-	if (ret) {
-		return ret;
+	int err = kstrtouint(buffer, 0, &state);
+	if (err) {
+		return err;
 	}
 
-	val = clamp_t(u8, val, 0, 1);
+	state = clamp_t(u8, state, 0, 1);
 
-	set_state(val);
+	set_state(state);
 
 	return size;
 }
@@ -303,28 +358,30 @@ static int set_color(u32 region, u32 color)
 	return tuxedo_evaluate_wmi_method(SET_KB_LED, cmd, NULL);
 }
 
-static int set_color_region(const char *buffer, size_t size, u32 region)
+static int set_color_region(const char *color_string, size_t size, u32 region)
 {
-	u32 val;
-	int ret = kstrtouint(buffer, 0, &val);
+	u32 colorcode;
+	int err = kstrtouint(color_string, 0, &colorcode);
 
-	if (ret) {
-		return ret;
+	if (err) {
+		return err;
 	}
 
-	if (!set_color(region, val)) {
+	if (!set_color(region, colorcode)) {
+		// after succesfully setting color, update our state struct
+		// depending on which region was changed
 		switch (region) {
 		case REGION_LEFT:
-			keyboard.color.left = val;
+			keyboard.color.left = colorcode;
 			break;
 		case REGION_CENTER:
-			keyboard.color.center = val;
+			keyboard.color.center = colorcode;
 			break;
 		case REGION_RIGHT:
-			keyboard.color.right = val;
+			keyboard.color.right = colorcode;
 			break;
 		case REGION_EXTRA:
-			keyboard.color.extra = val;
+			keyboard.color.extra = colorcode;
 			break;
 		}
 	}
@@ -360,15 +417,18 @@ static ssize_t set_color_extra_fs(struct device *child,
 	return set_color_region(buffer, size, REGION_EXTRA);
 }
 
-static void set_blinking_pattern(u8 mode)
+static void set_blinking_pattern(u8 blinkling_pattern)
 {
-	TUXEDO_INFO("set_mode on %s", blinking_patterns[mode].name);
+	TUXEDO_INFO("set_mode on %s", blinking_patterns[blinkling_pattern].name);
 
-	if (!tuxedo_evaluate_wmi_method(SET_KB_LED, blinking_patterns[mode].value, NULL)) {
-		keyboard.mode = mode;
+	if (!tuxedo_evaluate_wmi_method(SET_KB_LED, blinking_patterns[blinkling_pattern].value, NULL)) {
+		// wmi method was succesfull so update ur internal state struct
+		keyboard.blinking_pattern = blinkling_pattern;
 	}
 
-	if (mode == 0) {
+	if (blinkling_pattern == 0) {  // 0 is the "custom" blinking pattern
+
+		// so just set all regions to the stored colors
 		set_color(REGION_LEFT, keyboard.color.left);
 		set_color(REGION_CENTER, keyboard.color.center);
 		set_color(REGION_RIGHT, keyboard.color.right);
@@ -392,15 +452,15 @@ static ssize_t set_blinking_pattern_fs(struct device *child,
                                        struct device_attribute *attr,
                                        const char *buffer, size_t size)
 {
-	unsigned int val;
-	int ret = kstrtouint(buffer, 0, &val);
+	unsigned int blinking_pattern;
 
-	if (ret) {
-		return ret;
+	int err = kstrtouint(buffer, 0, &blinking_pattern);
+	if (err) {
+		return err;
 	}
 
-	val = clamp_t(u8, val, 0, ARRAY_SIZE(blinking_patterns) - 1);
-	set_blinking_pattern(val);
+	blinking_pattern = clamp_t(u8, blinking_pattern, 0, ARRAY_SIZE(blinking_patterns) - 1);
+	set_blinking_pattern(blinking_pattern);
 
 	return size;
 }
@@ -408,11 +468,11 @@ static ssize_t set_blinking_pattern_fs(struct device *child,
 static int blinking_pattern_id_validator(const char *val,
                                          const struct kernel_param *kp)
 {
-	int mode = 0;
+	int blinking_pattern = 0;
 
-	if (kstrtoint(val, 10, &mode) != 0
-	    || mode < 0
-	    || mode > (ARRAY_SIZE(blinking_patterns) - 1)) {
+	if (kstrtoint(val, 10, &blinking_pattern) != 0
+	    || blinking_pattern < 0
+	    || blinking_pattern > (ARRAY_SIZE(blinking_patterns) - 1)) {
 		return -EINVAL;
 	}
 
@@ -460,10 +520,10 @@ static void tuxedo_wmi_notify(u32 value, void *context)
 
 		break;
 
-	case WMI_CODE_NEXT_MODE:
+	case WMI_CODE_NEXT_BLINKING_PATTERN:
 		if (keyboard.change_button_mode == 0) {		   
-			set_blinking_pattern((keyboard.mode + 1) >
-			         (ARRAY_SIZE(blinking_patterns) - 1) ? 0 : (keyboard.mode + 1));
+		set_blinking_pattern((keyboard.blinking_pattern + 1) >
+		         (ARRAY_SIZE(blinking_patterns) - 1) ? 0 : (keyboard.blinking_pattern + 1));
 		} else {
 			set_color_pattern((keyboard.colormode + 1) >
 					(ARRAY_SIZE(color_modes) - 1) ? 0 : (keyboard.colormode + 1));
@@ -481,17 +541,13 @@ static void tuxedo_wmi_notify(u32 value, void *context)
 
 static int tuxedo_wmi_probe(struct platform_device *dev)
 {
-	int status;
+	int  status = wmi_install_notify_handler(CLEVO_EVENT_GUID, tuxedo_wmi_notify, NULL);
 
-	status =
-	    wmi_install_notify_handler(CLEVO_EVENT_GUID, tuxedo_wmi_notify,
-				       NULL);
 	// neuer name?
 	TUXEDO_DEBUG("clevo_xsm_wmi_probe status: (%0#6x)", status);
 
 	if (unlikely(ACPI_FAILURE(status))) {
-		TUXEDO_ERROR("Could not register WMI notify handler (%0#6x)\n",
-			     status);
+		TUXEDO_ERROR("Could not register WMI notify handler (%0#6x)\n", status);
 		return -EIO;
 	}
 
@@ -522,7 +578,7 @@ static struct platform_driver tuxedo_platform_driver = {
 		   },
 };
 
-// Sysfs device Attributes
+// Sysfs attribute file permissions and method linking
 static DEVICE_ATTR(state, 0644, show_state_fs, set_state_fs);
 static DEVICE_ATTR(color_left, 0644, show_color_left_fs, set_color_left_fs);
 static DEVICE_ATTR(color_center, 0644, show_color_center_fs,
@@ -596,6 +652,7 @@ static int __init tuxdeo_keyboard_init(void)
 	tuxedo_platform_device =
 	    platform_create_bundle(&tuxedo_platform_driver, tuxedo_wmi_probe,
 				   NULL, 0, NULL, 0);
+
 	if (unlikely(IS_ERR(tuxedo_platform_device))) {
 		TUXEDO_ERROR("Can not init Platform driver");
 		return PTR_ERR(tuxedo_platform_device);
@@ -606,27 +663,26 @@ static int __init tuxdeo_keyboard_init(void)
 		TUXEDO_ERROR("Could not register input device\n");
 	}
 
-	if (device_create_file(&tuxedo_platform_device->dev, &dev_attr_state) !=
-	    0) {
-		TUXEDO_ERROR("Sysfs attribute creation failed for state\n");
+	if (device_create_file(&tuxedo_platform_device->dev, &dev_attr_state) != 0) {
+		TUXEDO_ERROR("Sysfs attribute file creation failed for state\n");
 	}
 
 	if (device_create_file
 	    (&tuxedo_platform_device->dev, &dev_attr_color_left) != 0) {
 		TUXEDO_ERROR
-		    ("Sysfs attribute creation failed for color left\n");
+		    ("Sysfs attribute file creation failed for color left\n");
 	}
 
 	if (device_create_file
 	    (&tuxedo_platform_device->dev, &dev_attr_color_center) != 0) {
 		TUXEDO_ERROR
-		    ("Sysfs attribute creation failed for color center\n");
+		    ("Sysfs attribute file creation failed for color center\n");
 	}
 
 	if (device_create_file
 	    (&tuxedo_platform_device->dev, &dev_attr_color_right) != 0) {
 		TUXEDO_ERROR
-		    ("Sysfs attribute creation failed for color right\n");
+		    ("Sysfs attribute file creation failed for color right\n");
 	}
 
 	if (set_color(REGION_EXTRA, KB_COLOR_DEFAULT) != 0) {
@@ -638,7 +694,7 @@ static int __init tuxdeo_keyboard_init(void)
 		    (&tuxedo_platform_device->dev,
 		     &dev_attr_color_extra) != 0) {
 			TUXEDO_ERROR
-			    ("Sysfs attribute creation failed for color extra\n");
+			    ("Sysfs attribute file creation failed for color extra\n");
 		}
 
 		set_color(REGION_EXTRA, param_color_extra);
@@ -647,18 +703,18 @@ static int __init tuxdeo_keyboard_init(void)
 	if (device_create_file(&tuxedo_platform_device->dev, &dev_attr_extra) !=
 	    0) {
 		TUXEDO_ERROR
-		    ("Sysfs attribute creation failed for extra information flag\n");
+		    ("Sysfs attribute file creation failed for extra information flag\n");
 	}
 
 	if (device_create_file(&tuxedo_platform_device->dev, &dev_attr_mode) !=
 	    0) {
-		TUXEDO_ERROR("Sysfs attribute creation failed for mode\n");
+		TUXEDO_ERROR("Sysfs attribute file creation failed for blinking pattern\n");
 	}
 
 	if (device_create_file
 	    (&tuxedo_platform_device->dev, &dev_attr_brightness) != 0) {
 		TUXEDO_ERROR
-		    ("Sysfs attribute creation failed for brightness\n");
+		    ("Sysfs attribute file creation failed for brightness\n");
 	}
 
 	keyboard.color.left = param_color_left;
@@ -670,7 +726,7 @@ static int __init tuxdeo_keyboard_init(void)
 	set_color(REGION_CENTER, param_color_center);
 	set_color(REGION_RIGHT, param_color_right);
 
-	set_blinking_pattern(param_mode);
+	set_blinking_pattern(param_blinking_pattern);
 	set_brightness(param_brightness);
 	set_state(param_state);
 
