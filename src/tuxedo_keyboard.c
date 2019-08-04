@@ -84,7 +84,7 @@ MODULE_PARM_DESC(state,
 static struct {
 	u8 has_extra;
 	u8 state;
-
+    u8 change_button_mode;
 	struct {
 		u32 left;
 		u32 center;
@@ -94,8 +94,9 @@ static struct {
 
 	u8 brightness;
 	u8 mode;
+    u8 colormode;
 } keyboard = {
-	.has_extra = 0, .mode = DEFAULT_MODE,
+	.has_extra = 0, .change_button_mode=1, .mode = DEFAULT_MODE, .colormode = 6,
 	.state = 1, .brightness = BRIGHTNESS_DEFAULT,
 	.color = {
 	        .left = KB_COLOR_DEFAULT, .center = KB_COLOR_DEFAULT,
@@ -116,6 +117,20 @@ static struct {
         { .key = 5,.value = 0x70000000,.name = "RANDOM_COLOR"},
         { .key = 6,.value = 0x90000000,.name = "TEMPO"},
         { .key = 7,.value = 0xB0000000,.name = "WAVE"}
+};
+
+static struct {
+	u8 key;
+	u32 value;
+	const char *const name;
+} color_modes[] = {
+        { .key = 0,.value = COLOR_RED,.name = "Red"},
+        { .key = 1,.value = COLOR_GREEN,.name = "Green"},
+        { .key = 2,.value = COLOR_BLUE,.name = "Blue"},
+        { .key = 3,.value = COLOR_YELLOW,.name = "Yellow"},
+        { .key = 4,.value = COLOR_MAGENTA,.name = "Magenta"},
+        { .key = 5,.value = COLOR_CYAN,.name = "Cyan"},
+        { .key = 6,.value = COLOR_WHITE,.name = "White"}
 };
 
 // Sysfs Interface Methods
@@ -364,6 +379,15 @@ static void set_blinking_pattern(u8 mode)
 	}
 }
 
+static void set_color_pattern(u8 mode)
+{
+	TUXEDO_INFO("set_color_mode on %s", color_modes[mode].name);
+
+	keyboard.colormode=mode;
+	set_color(REGION_LEFT, color_modes[mode].value);
+
+}
+
 static ssize_t set_blinking_pattern_fs(struct device *child,
                                        struct device_attribute *attr,
                                        const char *buffer, size_t size)
@@ -437,9 +461,14 @@ static void tuxedo_wmi_notify(u32 value, void *context)
 		break;
 
 	case WMI_CODE_NEXT_MODE:
-		set_blinking_pattern((keyboard.mode + 1) >
-		         (ARRAY_SIZE(blinking_patterns) - 1) ? 0 : (keyboard.mode + 1));
-		break;
+		if (keyboard.change_button_mode == 0) {		   
+			set_blinking_pattern((keyboard.mode + 1) >
+			         (ARRAY_SIZE(blinking_patterns) - 1) ? 0 : (keyboard.mode + 1));
+		} else {
+			set_color_pattern((keyboard.colormode + 1) >
+					(ARRAY_SIZE(color_modes) - 1) ? 0 : (keyboard.colormode + 1));
+		}
+		break;		
 
 	case WMI_CODE_TOGGLE_STATE:
 		set_state(keyboard.state == 0 ? 1 : 0);
