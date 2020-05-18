@@ -1,3 +1,8 @@
+IMPORTANT: The original driver works as expected at my notebook now. You use that directly :) So, this repository will not be maintained anymore.
+
+
+---
+
 Note: It's just a patch to change the chame mode button's functionality to change colors. My Clevo based turkish brand Monster notebook's keyboard is a single colored keybpard without support modes. Also left color is the keyboard's single color. 
 
 Note: I think Monster notebook owners with multi colored keyboard can use the original tuxedo_keyboard source directly or this one if they prefer.
